@@ -311,7 +311,7 @@ app.post("/api/chat", async (req, res) => {
     res.json({ reply: result.response.text(), source: "ai-kampus" });
   } catch (err) {
     console.error("Error /api/chat:", err.message);
-    res.status(500).json({ error: "Terjadi kendala di server, coba lagi sebentar." });
+    res.status(500).json({ error: "Terjadi kendala di server, coba lagi sebentar.", detail: err.message });
   }
 });
 

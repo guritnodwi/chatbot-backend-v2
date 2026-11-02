@@ -3,6 +3,7 @@ import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import multer from "multer";
 import mammoth from "mammoth";
@@ -15,7 +16,12 @@ const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD; // password buat login halaman admin
-const DATA_DIR = "./data";
+const DATA_DIR = path.join(process.cwd(), "data");
+
+// [VERCEL] Di Vercel, disk bersifat read-only → upload/hapus file tidak bisa disimpan.
+const IS_VERCEL = !!process.env.VERCEL;
+const PESAN_READONLY =
+  "Di Vercel, upload/hapus file tidak bisa disimpan. Ubah FAQ dengan mengedit file .docx di folder data/ pada GitHub, lalu Vercel akan deploy ulang otomatis.";
 
 if (!GEMINI_API_KEY) {
   console.error("❌ GEMINI_API_KEY belum diisi di file .env");
@@ -26,7 +32,11 @@ if (!ADMIN_PASSWORD) {
   process.exit(1);
 }
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
+try {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+} catch (err) {
+  console.warn("Tidak bisa membuat folder data:", err.message);
+}
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const MODEL_NAME = "gemini-3.6-flash";
@@ -50,9 +60,13 @@ let faqList = []; // [{ question, answer, source }]
 let fileStats = {}; // { "nama.docx": jumlahEntri }
 
 function daftarFileDocx() {
-  return fs
-    .readdirSync(DATA_DIR)
-    .filter((f) => f.toLowerCase().endsWith(".docx") && !f.startsWith("~$"));
+  try {
+    return fs
+      .readdirSync(DATA_DIR)
+      .filter((f) => f.toLowerCase().endsWith(".docx") && !f.startsWith("~$"));
+  } catch {
+    return [];
+  }
 }
 
 async function parseSatuFile(namaFile) {
@@ -99,17 +113,23 @@ function muatSemuaFaq() {
   return sedangMuat;
 }
 
-// Pantau folder: file .docx apa pun yang ditambah/diganti/dihapus → otomatis dimuat ulang (debounce).
-let debounceTimer;
-fs.watch(DATA_DIR, (eventType, filename) => {
-  if (filename && filename.toLowerCase().endsWith(".docx")) {
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      muatSemuaFaq().catch((err) => console.error("Gagal reload otomatis:", err.message));
-    }, 500);
-  }
-});
+// [VERCEL] Pemantau folder & reload berkala hanya dijalankan di server biasa (bukan serverless).
 const RELOAD_INTERVAL_MS = 5 * 60 * 1000;
+if (!IS_VERCEL) {
+  let debounceTimer;
+  try {
+    fs.watch(DATA_DIR, (eventType, filename) => {
+      if (filename && filename.toLowerCase().endsWith(".docx")) {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          muatSemuaFaq().catch((err) => console.error("Gagal reload otomatis:", err.message));
+        }, 500);
+      }
+    });
+  } catch (err) {
+    console.warn("Tidak bisa memantau folder data:", err.message);
+  }
+}
 
 // =========================================================
 // 3. COCOKKAN PERTANYAAN USER KE FAQ (pakai Gemini sebagai "pemilih")
@@ -196,7 +216,7 @@ function cekAdmin(req, res, next) {
 
 // Simpan upload sementara sebelum divalidasi jadi .docx
 const upload = multer({
-  dest: "./tmp-uploads",
+  dest: path.join(os.tmpdir(), "tmp-uploads"), // [VERCEL] hanya /tmp yang boleh ditulis
   limits: { fileSize: 10 * 1024 * 1024, files: 20 }, // maks 10MB per file, 20 file sekali upload
   fileFilter: (req, file, cb) => {
     const ok = file.originalname.toLowerCase().endsWith(".docx");
@@ -223,9 +243,17 @@ function bukanDocxValid(filePath) {
 // 5. SERVER EXPRESS
 // =========================================================
 const app = express();
+app.set("trust proxy", 1); // [VERCEL] wajib agar rate-limit membaca IP asli di belakang proxy
 app.use(express.json());
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(express.static("public")); // buat menyajikan halaman admin.html
+
+// [VERCEL] Pastikan FAQ sudah dimuat sebelum request pertama diproses (cold start serverless).
+let faqSiap = null;
+app.use((req, res, next) => {
+  faqSiap ??= muatSemuaFaq();
+  faqSiap.then(() => next()).catch(next);
+});
 
 const limiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
 app.use("/api/", limiter);
@@ -307,6 +335,9 @@ app.get("/api/admin/files", cekAdmin, (req, res) => {
 app.post("/api/admin/upload-faq", cekAdmin, upload.array("files", 20), async (req, res) => {
   const uploaded = req.files || [];
   try {
+    // [VERCEL] Disk read-only: tolak dengan pesan yang jelas
+    if (IS_VERCEL) return res.status(501).json({ error: PESAN_READONLY });
+
     if (uploaded.length === 0) return res.status(400).json({ error: "Tidak ada file dikirim" });
 
     const tersimpan = [];
@@ -333,6 +364,9 @@ app.post("/api/admin/upload-faq", cekAdmin, upload.array("files", 20), async (re
 
 // Hapus satu file .docx
 app.delete("/api/admin/files/:name", cekAdmin, async (req, res) => {
+  // [VERCEL] Disk read-only: tolak dengan pesan yang jelas
+  if (IS_VERCEL) return res.status(501).json({ error: PESAN_READONLY });
+
   const nama = path.basename(req.params.name);
   const target = path.join(DATA_DIR, nama);
   if (!nama.toLowerCase().endsWith(".docx") || !fs.existsSync(target)) {
@@ -357,8 +391,13 @@ app.use((err, req, res, next) => {
 // =========================================================
 // 6. JALANKAN SERVER
 // =========================================================
-app.listen(PORT, async () => {
-  console.log(`🚀 Server jalan di http://localhost:${PORT}`);
-  await muatSemuaFaq();
-  setInterval(muatSemuaFaq, RELOAD_INTERVAL_MS);
-});
+// [VERCEL] Di Vercel tidak ada app.listen — Vercel yang memanggil `app` langsung.
+if (!IS_VERCEL) {
+  app.listen(PORT, async () => {
+    console.log(`🚀 Server jalan di http://localhost:${PORT}`);
+    await muatSemuaFaq();
+    setInterval(muatSemuaFaq, RELOAD_INTERVAL_MS);
+  });
+}
+
+export default app;
